@@ -2,7 +2,7 @@
 
 Features: 4K/PCVR(200%)/Quest(Not yet, native working but not optimized)
 
-Watch on Youtube
+Watch on Youtube:
 
 [![Watch on YouTube](https://img.youtube.com/vi/rQAwTf139lM/maxresdefault.jpg)](https://youtu.be/rQAwTf139lM)
 
