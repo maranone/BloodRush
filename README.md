@@ -1,4 +1,4 @@
-# BloodRush, an unofficial Rush of Blood for shadPS4.
+# BloodRush, an unofficial Until Down: Rush of Blood for shadPS4.
 
 Features: 4K/PCVR(200%)/Quest(Not yet, native working but not optimized)
 
@@ -18,7 +18,7 @@ If you enjoy this work, you can buy me a coffee: **https://ko-fi.com/retrodepth*
 
 Huge shout-out to **detective_yoshi**
 
-## Go to Releases to find the latest version
+## Go to Releases to find the latest version (NO ASSETS NOR GAME FILES PROVIDED) 
 
 ## What’s in here
 
