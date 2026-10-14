@@ -1,0 +1,1011 @@
+diff --git a/sdl_window.cpp b/sdl_window.cpp
+--- a/sdl_window.cpp
++++ b/sdl_window.cpp
+@@ -25,6 +25,7 @@
+ #include "core/user_settings.h"
+ #include "imgui/renderer/imgui_core.h"
+ #include "input/controller.h"
++#include "input/desktop_play.h"
+ #include "input/scripted_input.h"
+ #include "input/input_handler.h"
+ #include "input/input_mouse.h"
+@@ -165,6 +166,10 @@
+     }
+     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
+     SDL_SyncWindow(window);
++    if (Input::DesktopPlay::Enabled()) {
++        SDL_SetWindowRelativeMouseMode(window, true);
++        Input::DesktopPlay::Start();
++    }
+ 
+ #ifndef ENABLE_BACHATA_RUNTIME
+     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+@@ -374,6 +379,11 @@
+         return;
+     }
+ 
++    // Keyboard and mouse play the headset and its controllers (SHADPS4_DESKTOP_PLAY=1).
++    if (Input::DesktopPlay::Enabled() && Input::DesktopPlay::OnEvent(event)) {
++        return;
++    }
++
+     if (Libraries::Mouse::PushSDLEvent(event)) {
+         return;
+     }
+diff --git a/core/vr/spectator_view.h b/core/vr/spectator_view.h
+--- a/core/vr/spectator_view.h
++++ b/core/vr/spectator_view.h
+@@ -12,11 +12,16 @@
+ 
+ namespace Core::Vr {
+ 
+-enum class DesktopView { Stereo, Spectator, Combined };
++// Flat: the left eye alone, stretched over the whole window, for playing on a monitor (give the
++// title a field of view of the window's shape: SHADPS4_VR_HEADSET_FOV_TAN).
++enum class DesktopView { Stereo, Spectator, Combined, Flat };
+ 
+ inline DesktopView ParseDesktopView(std::string_view value) {
+     if (value == "combined") {
+         return DesktopView::Combined;
++    }
++    if (value == "flat") {
++        return DesktopView::Flat;
+     }
+     return value == "spectator" ? DesktopView::Spectator : DesktopView::Stereo;
+ }
+@@ -60,6 +65,25 @@
+             content_width, content_height};
+ }
+ 
++/// The part of an eye's picture Flat shows, as {scale_x, scale_y, offset_x, offset_y} of its
++/// texture coordinates: the largest rectangle of the window's shape inside the round view a
++/// title draws (Rush of Blood: a circle as wide as the smallest of the four angles). Give the
++/// title equal angles all round and this keeps the middle, without the circle's edge.
++inline std::array<float, 4> FlatEyeCrop(const Fov& fov, float window_aspect) {
++    if (!ValidSpectatorFov(fov) || !std::isfinite(window_aspect) || window_aspect <= 0.0f) {
++        return {1.0f, 1.0f, 0.0f, 0.0f};
++    }
++    const float width = fov.tan_out + fov.tan_in;
++    const float height = fov.tan_top + fov.tan_bottom;
++    const float radius =
++        std::min({fov.tan_out, fov.tan_in, fov.tan_top, fov.tan_bottom}) * 0.985f;
++    const float diagonal = std::sqrt(1.0f + window_aspect * window_aspect);
++    const float half_x = std::min(radius * window_aspect / diagonal, width / 2);
++    const float half_y = std::min(radius / diagonal, height / 2);
++    return {2 * half_x / width, 2 * half_y / height, (fov.tan_out - half_x) / width,
++            (fov.tan_top - half_y) / height};
++}
++
+ struct HorizontalEyeRegion {
+     u32 x;
+     u32 width;
+diff --git a/video_core/renderer_vulkan/vk_presenter.cpp b/video_core/renderer_vulkan/vk_presenter.cpp
+--- a/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -2,10 +2,6 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/debug.h"
+-#include "video_core/renderer_vulkan/rob_depth_content.h"
+-#include <xxhash.h>
+-#include <unordered_map>
+-#include <fstream>
+ #include "common/elf_info.h"
+ #include "common/io_file.h"
+ #include "common/path_util.h"
+@@ -29,8 +25,8 @@
+ #include "video_core/amdgpu/stall_log.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
++#include "video_core/renderer_vulkan/rob_depth_content.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+-#include "video_core/renderer_vulkan/rob_lens_mask.h"
+ #include "video_core/texture_cache/image.h"
+ 
+ #include <algorithm>
+@@ -40,16 +36,21 @@
+ #include <chrono>
+ #include <cmath>
+ #include <csetjmp>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <filesystem>
++#include <fstream>
+ #include <iomanip>
+ #include <limits>
+ #include <memory>
++#include <mutex>
+ #include <span>
+ #include <sstream>
+ #include <system_error>
++#include <unordered_map>
+ #include <vector>
++#include <xxhash.h>
+ #include <boost/container/static_vector.hpp>
+ #include <imgui.h>
+ #include <png.h>
+@@ -963,7 +964,11 @@
+             if (std::filesystem::exists(dump_flag, ec)) {
+                 std::filesystem::remove(dump_flag, ec);
+                 DumpGpuImages();
+-                Rasterizer::StartDrawTrace(3000);
++                // Optional: SHADPS4_DUMP_DRAW_TRACE=1 also starts a short draw trace.
++                if (const char* trace = std::getenv("SHADPS4_DUMP_DRAW_TRACE");
++                    trace != nullptr && trace[0] == '1') {
++                    Rasterizer::StartDrawTrace(3000);
++                }
+             }
+             // <UserDir>/dump_image: only the textures at the addresses written in it (hex, apart
+             // by commas), raw: without the pictures of every target, which some drivers fail.
+@@ -1105,11 +1110,13 @@
+         return value != nullptr && std::string_view{value} == "1";
+     }();
+     const bool crop = spectator && desktop_crop;
++    // Flat fills the window whatever its shape: the window's frame decides the aspect below.
++    const bool flat = spectator && desktop_view == Core::Vr::DesktopView::Flat;
+     const float desktop_aspect = Core::Vr::DesktopViewAspect(
+         desktop_view, fov, static_cast<float>(eye_width) / eye_height);
+     Frame* const local = exported ? nullptr : vr_exporter->AcquireLocal(eye_width * 2, eye_height);
+     if (!exported) {
+-        expected_ratio = crop ? std::nullopt : std::optional{desktop_aspect};
++        expected_ratio = crop || flat ? std::nullopt : std::optional{desktop_aspect};
+         frame = GetRenderFrame();
+         if (!frame && !local) {
+             return {};
+@@ -1158,16 +1165,10 @@
+     }
+     // Sample the eye's exact source rectangle inside its own destination viewport.
+     // Expanding the viewport to crop a packed texture permits filtering across the seam.
+-    static const float lens_mask_scale = [] {
+-        const char* value = std::getenv("SHADPS4_VR_MASK");
+-        return RobLensMaskScale(value != nullptr ? std::string_view{value} : std::string_view{});
+-    }();
+-    const auto serial = Common::ElfInfo::Instance().GameSerial();
+     const auto eye_part = [&](u32 eye, HostPasses::PostProcessingPass::Region region) {
+         const float from = std::clamp(eye_u[eye][0], 0.0f, 0.99f);
+         const float width = std::clamp(eye_u[eye][1] - from, 0.01f, 1.0f - from);
+         region.source_uv = {width, 1.0f, from, 0.0f};
+-        region.lens_mask = RobLensMask(serial, from, width, lens_mask_scale);
+         region.clip = region.clip.value_or(region.area);
+         return region;
+     };
+@@ -1199,8 +1200,10 @@
+     auto hmd_settings = pp_settings;
+     hmd_settings.sharpen = sharpen;
+     if (frame != nullptr) {
+-        const auto bounds = Core::Vr::SpectatorContentRect(frame->width, frame->height,
+-                                                        desktop_aspect, crop);
++        const auto bounds =
++            flat ? Core::Vr::SpectatorRect{0, 0, frame->width, frame->height}
++                 : Core::Vr::SpectatorContentRect(frame->width, frame->height, desktop_aspect,
++                                                  crop);
+         const vk::Rect2D content{{bounds.x, bounds.y}, {bounds.width, bounds.height}};
+         const vk::Rect2D clip{{bounds.x, std::max(0, bounds.y)},
+                              {bounds.width, std::min(bounds.height, frame->height)}};
+@@ -1226,10 +1229,19 @@
+             const auto count = layout[1].clip_width == 0 ? 1u : 2u;
+             pp_pass.Render(cmdbuf, std::span{regions}.first(count), *frame, hmd_settings);
+         } else if (spectator) {
+-            const std::array regions{
++            std::array regions{
+                 eye_part(0, HostPasses::PostProcessingPass::Region{
+                                 .input = eye_views[0], .area = content, .clip = clip}),
+             };
++            if (flat) {
++                // Only the rectangle of the window's shape inside the title's round view.
++                // Keep this crop in 4K mode too: the game still renders its round headset view.
++                const auto crop_uv = Core::Vr::FlatEyeCrop(
++                    fov, static_cast<float>(frame->width) / std::max(1u, frame->height));
++                auto& uv = regions[0].source_uv;
++                uv = {uv[0] * crop_uv[0], uv[1] * crop_uv[1], uv[2] + uv[0] * crop_uv[2],
++                      uv[3] + uv[1] * crop_uv[3]};
++            }
+             pp_pass.Render(cmdbuf, regions, *frame, hmd_settings);
+         } else {
+             pp_pass.Render(cmdbuf, regions_for(*frame), *frame, hmd_settings,
+@@ -1550,13 +1562,17 @@
+         const int width = value != nullptr ? std::atoi(value) : 0;
+         return width >= 64 ? static_cast<u32>(width) : 640u;
+     }();
+-    const auto dump_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "rt_dump";
++    // Keep prior dumps so two consecutive captures can be compared (depth vs irradiance).
++    static std::atomic<u32> dump_seq{0};
++    const auto dump_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "rt_dump" /
++                          fmt::format("dump_{:03}", dump_seq.fetch_add(1));
+     std::error_code ec;
+-    std::filesystem::remove_all(dump_dir, ec);
+     std::filesystem::create_directories(dump_dir, ec);
+ 
+     // Collect first: transitions and submits below must not run under the cache lock.
+     std::vector<VideoCore::Image*> images;
++    std::vector<VideoCore::Image*> depth_images;
++    std::vector<VideoCore::Image*> row_images;
+     texture_cache.ForEachImage([&](VideoCore::Image& image) {
+         const auto& info = image.info;
+         LOG_INFO(Render_Vulkan,
+@@ -1565,12 +1581,36 @@
+                  vk::to_string(info.pixel_format), info.num_samples, info.resources.levels,
+                  info.resources.layers, static_cast<u32>(image.flags),
+                  info.props.is_depth ? ", depth" : "");
+-        if (!(image.flags & VideoCore::ImageFlagBits::GpuModified) || info.props.is_depth ||
+-            info.props.is_volume || info.size.width < 64 || info.size.height < 64) {
++        if (!(image.flags & VideoCore::ImageFlagBits::GpuModified) || info.props.is_volume) {
++            return;
++        }
++        const bool is_row = !info.props.is_depth && info.size.height == 1 && info.size.width > 1 &&
++                            info.size.width <= 64;
++        // Skip full-res scene depth (driver crash on 4K D32S8 readback). Soft-shadow maps are
++        // typically <= 1024.
++        if (info.props.is_depth && info.num_samples == 1 && info.size.width >= 64 &&
++            info.size.height >= 64 && info.size.width <= 2048 && info.size.height <= 2048) {
++            depth_images.push_back(&image);
++            return;
++        }
++        if (is_row) {
++            row_images.push_back(&image);
++            return;
++        }
++        // Prefer large color RTs only â€” dumping dozens of 4K targets has crashed the NVIDIA driver.
++        if (info.props.is_depth || info.size.width < 512 || info.size.height < 512) {
+             return;
+         }
+         images.push_back(&image);
+     });
++    std::sort(images.begin(), images.end(), [](const VideoCore::Image* a, const VideoCore::Image* b) {
++        const u64 sa = u64{a->info.size.width} * a->info.size.height;
++        const u64 sb = u64{b->info.size.width} * b->info.size.height;
++        return sa > sb;
++    });
++    if (images.size() > 8) {
++        images.resize(8);
++    }
+ 
+     const vk::Device device = instance.GetDevice();
+     u32 index = 0;
+@@ -1709,7 +1749,33 @@
+             vmaDestroyImage(instance.GetAllocator(), resolved_handle, resolved_allocation);
+         }
+     }
+-    LOG_INFO(Render_Vulkan, "Dumped {} render targets to {}", index, dump_dir.string());
++
++    // GPU depth/row readback has crashed NVIDIA drivers here; metadata only for those.
++    {
++        std::ofstream manifest{dump_dir / "depth_manifest.txt"};
++        for (VideoCore::Image* image : depth_images) {
++            const auto& info = image->info;
++            manifest << fmt::format(
++                "{:x} {}x{} {} flags={:#x} guest_size={:#x} gpu_modified={}\n", info.guest_address,
++                info.size.width, info.size.height, vk::to_string(info.pixel_format),
++                static_cast<u32>(image->flags), info.guest_size,
++                (image->flags & VideoCore::ImageFlagBits::GpuModified) ? 1 : 0);
++        }
++        manifest << fmt::format("row_targets {}\n", row_images.size());
++        for (VideoCore::Image* image : row_images) {
++            const auto& info = image->info;
++            manifest << fmt::format("row {:x} {}x{} {} flags={:#x}\n", info.guest_address,
++                                    info.size.width, info.size.height,
++                                    vk::to_string(info.pixel_format),
++                                    static_cast<u32>(image->flags));
++        }
++    }
++
++    LOG_INFO(Render_Vulkan, "Dumped {} color + {} depth(meta) + {} row(meta) targets to {}",
++             images.size(), depth_images.size(), row_images.size(), dump_dir.string());
++    {
++        std::ofstream{dump_dir / "DONE.txt"} << "ok\n";
++    }
+ 
+     // SHADPS4_DUMP_IMAGE=<address>: the texture at that address as it is held, every level with
+     // all its layers, raw (rt_dump/image_<address>_level<n>_<w>x<h>x<layers>_<format>.bin): for
+diff --git a/video_core/renderer_vulkan/vk_rasterizer.cpp b/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include <array>
+ #include <bit>
++#include <unordered_map>
+ 
+ #include <vk_mem_alloc.h>
+ #include <xxhash.h>
+@@ -61,6 +62,41 @@
+ bool IsRobStereoExtent(u32 width, u32 height) {
+     return (width == 2304 && height == 1296) || (width == 4608 && height == 2592) ||
+            (width == 2688 && height == 1512) || (width == 5376 && height == 3024);
++}
++
++bool RobBulbShadowDiag() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHADPS4_ROB_BULB_SHADOW");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++// Carnival focal soft-shadow maps: 1024Â² D16 and 256Â² D32 (not just one bulb).
++bool IsRobFocalShadow(u32 width, u32 height, vk::Format format) {
++    if (width == 1024 && height == 1024 && format == vk::Format::eD16Unorm) {
++        return true;
++    }
++    if (width == 256 && height == 256 &&
++        (format == vk::Format::eD32SfloatS8Uint || format == vk::Format::eD32Sfloat)) {
++        return true;
++    }
++    return false;
++}
++
++bool IsRobFocalShadowRegs(const AmdGpu::DepthBuffer& db) {
++    if (!db.DepthValid()) {
++        return false;
++    }
++    if (db.Pitch() == 1024 && db.Height() == 1024 &&
++        db.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z16) {
++        return true;
++    }
++    if (db.Pitch() == 256 && db.Height() == 256 &&
++        db.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z32Float) {
++        return true;
++    }
++    return false;
+ }
+ 
+ struct GpuWrite {
+@@ -571,9 +607,27 @@
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     UpdateDynamicState(pipeline, is_indexed);
+     scheduler.BeginRendering(state);
++
++    // Diagnostics observe guest draws, including small casters; never suppress them.
++    if (RobBulbShadowDiag() && IsRobFocalShadowRegs(regs.depth_buffer)) {
++        static u64 observed_draws = 0;
++        const u64 draw = observed_draws++;
++        const u32 count = regs.num_indices * regs.num_instances.NumInstances();
++        if (draw < 128 || draw % 1024 == 0) {
++            LOG_WARNING(Render_Vulkan,
++                        "ROB_DEPTH_DRAW n={} addr={:#x} indices={} depth_write={} "
++                        "depth_test={} compare={} clear={} color_mask={:#x}",
++                        draw, regs.depth_buffer.DepthAddress(), count,
++                        static_cast<bool>(regs.depth_control.depth_write_enable),
++                        static_cast<bool>(regs.depth_control.depth_enable),
++                        static_cast<u32>(regs.depth_control.depth_func),
++                        static_cast<bool>(regs.depth_render_control.depth_clear_enable),
++                        regs.color_target_mask.raw);
++        }
++    }
++
+     scheduler.NoteDraw();
+     FrameStats::Draw();
+-
+     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+     const auto& fetch_shader = pipeline->GetFetchShader();
+     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+@@ -1894,12 +1948,12 @@
+     if (auto image_id = db_desc.first; image_id) {
+         auto& desc = db_desc.second;
+         const auto htile_address = regs.depth_htile_data_base.GetAddress();
++        auto& image = texture_cache.GetImage(image_id);
+         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+-        auto& image = texture_cache.GetImage(image_id);
+ 
+         const auto slice = image_view.info.range.base.layer;
+-        const bool is_depth_clear = regs.depth_render_control.depth_clear_enable ||
+-                                    texture_cache.IsMetaCleared(htile_address, slice);
++        bool is_depth_clear = regs.depth_render_control.depth_clear_enable ||
++                              texture_cache.IsMetaCleared(htile_address, slice);
+         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+         texture_cache.TouchMeta(htile_address, slice, false);
+         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
+@@ -1922,6 +1976,18 @@
+             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+             attachment.has_depth = true;
+             attachment.depth_clear = is_depth_clear;
++            if (IsRobFocalShadow(image.info.size.width, image.info.size.height,
++                                 image.info.pixel_format)) {
++                static u32 clear_logs = 0;
++                if (RobBulbShadowDiag() && clear_logs++ < 64) {
++                    LOG_WARNING(Render_Vulkan,
++                                "ROB_DEPTH_PASS {:#x} clear={} "
++                                "depth_clear={:g} htile={:#x} {}x{}",
++                                image.info.guest_address, is_depth_clear ? 1 : 0,
++                                regs.depth_clear, htile_address,
++                                image.info.size.width, image.info.size.height);
++                }
++            }
+         }
+         if (regs.depth_buffer.StencilValid() && image.info.props.has_stencil) {
+             rob_scene_lens_stencil = RobStencilBaselineExperiment() &&
+diff --git a/video_core/texture_cache/texture_cache.cpp b/video_core/texture_cache/texture_cache.cpp
+--- a/video_core/texture_cache/texture_cache.cpp
++++ b/video_core/texture_cache/texture_cache.cpp
+@@ -234,6 +234,62 @@
+     return enabled;
+ }
+ 
++static bool RobBulbShadowDiagEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHADPS4_ROB_BULB_SHADOW");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++/// Intro cage-bulb dynamic soft shadows use a dedicated 1024Â² D16 map (sometimes 256Â² D32S8).
++static bool IsRobBulbShadowDepth(const ImageInfo& info) {
++    if (!info.props.is_depth || info.num_samples != 1) {
++        return false;
++    }
++    if (info.size.width == 1024 && info.size.height == 1024 &&
++        info.pixel_format == vk::Format::eD16Unorm) {
++        return true;
++    }
++    if (info.size.width == 256 && info.size.height == 256 &&
++        (info.pixel_format == vk::Format::eD32SfloatS8Uint ||
++         info.pixel_format == vk::Format::eD32Sfloat)) {
++        return true;
++    }
++    return false;
++}
++
++struct BulbShadowDiag {
++    u32 depth_bind{};
++    u32 sample_bind{};
++    u32 cpu_invalidate{};
++    u32 cpu_invalidate_preserved{};
++    u32 gpu_invalidate_skipped{};
++    u32 refresh_skipped{};
++    u32 refresh_upload{};
++    VAddr last_addr{};
++};
++static BulbShadowDiag g_bulb_shadow{};
++
++static void BulbShadowNote(const char* what, const ImageInfo& info, ImageFlagBits flags) {
++    if (!RobBulbShadowDiagEnabled() || !IsRobBulbShadowDepth(info)) {
++        return;
++    }
++    g_bulb_shadow.last_addr = info.guest_address;
++    static u32 samples = 0;
++    if (samples++ < 48 || (samples % 64) == 0) {
++        LOG_WARNING(Render_Vulkan,
++                    "ROB_BULB_SHADOW {} {:#x} {}x{} {} flags={:#x} "
++                    "bind_d={} bind_s={} cpu_inv={} preserved={} gpu_skip={} refresh_skip={} "
++                    "refresh_up={}",
++                    what, info.guest_address, info.size.width, info.size.height,
++                    vk::to_string(info.pixel_format), static_cast<u32>(flags),
++                    g_bulb_shadow.depth_bind, g_bulb_shadow.sample_bind, g_bulb_shadow.cpu_invalidate,
++                    g_bulb_shadow.cpu_invalidate_preserved, g_bulb_shadow.gpu_invalidate_skipped,
++                    g_bulb_shadow.refresh_skipped, g_bulb_shadow.refresh_upload);
++    }
++}
++
+ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+     std::scoped_lock lock{mutex};
+     const auto pages_start = PageManager::GetPageAddr(addr);
+@@ -247,8 +303,16 @@
+             // depth with empty/stale guest bytes and soft shadows blink off.
+             if (DepthPreserveEnabled() && image.info.props.is_depth &&
+                 True(image.flags & ImageFlagBits::GpuModified)) {
++                if (IsRobBulbShadowDepth(image.info)) {
++                    ++g_bulb_shadow.cpu_invalidate_preserved;
++                    BulbShadowNote("cpu_fault_preserved", image.info, image.flags);
++                }
+                 UntrackImage(image_id);
+                 return;
++            }
++            if (IsRobBulbShadowDepth(image.info)) {
++                ++g_bulb_shadow.cpu_invalidate;
++                BulbShadowNote("cpu_fault_dirty", image.info, image.flags);
+             }
+             // Modified region overlaps image, so the image was definitely accessed by this fault.
+             // Untrack the image, so that the range is unprotected and the guest can write freely.
+@@ -285,6 +349,10 @@
+         // lets RefreshImage upload empty/stale guest bytes and soft shadows blink off.
+         if (DepthPreserveEnabled() && image.info.props.is_depth &&
+             True(image.flags & ImageFlagBits::GpuModified)) {
++            if (IsRobBulbShadowDepth(image.info)) {
++                ++g_bulb_shadow.gpu_invalidate_skipped;
++                BulbShadowNote("gpu_inv_skipped", image.info, image.flags);
++            }
+             return;
+         }
+         image.flags |= ImageFlagBits::GpuDirty;
+@@ -955,6 +1023,10 @@
+ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     LogViewDimensionMismatch(desc, image);
++    if (IsRobBulbShadowDepth(image.info)) {
++        ++g_bulb_shadow.sample_bind;
++        BulbShadowNote("sample", image.info, image.flags);
++    }
+     if (desc.type == BindingType::Storage) {
+         image.flags |= ImageFlagBits::GpuModified;
+         if (readback_linear_images && !image.info.props.is_tiled && image.info.guest_address != 0) {
+@@ -1018,6 +1090,10 @@
+ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     image.usage.depth_target = 1u;
++    if (IsRobBulbShadowDepth(image.info)) {
++        ++g_bulb_shadow.depth_bind;
++        BulbShadowNote("depth_target", image.info, image.flags);
++    }
+     // Initialize newly bound depth from its authoritative backing before claiming GPU ownership.
+     // Marking it GPU-modified first made DepthPreserve skip the initial upload.
+     UpdateImage(image_id);
+@@ -1090,8 +1166,17 @@
+     // Depth that the GPU already owns must not be replaced by a guest/buffer snapshot.
+     // CpuDirty used to punch through here; shared-page faults made soft shadows blink.
+     if (DepthPreserveEnabled() && image.info.props.is_depth && is_gpu_modified) {
++        if (IsRobBulbShadowDepth(image.info)) {
++            ++g_bulb_shadow.refresh_skipped;
++            BulbShadowNote("refresh_skipped", image.info, image.flags);
++        }
+         image.flags &= ~ImageFlagBits::Dirty;
+         return;
++    }
++    if (IsRobBulbShadowDepth(image.info) &&
++        True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::GpuDirty))) {
++        ++g_bulb_shadow.refresh_upload;
++        BulbShadowNote("refresh_upload", image.info, image.flags);
+     }
+ 
+     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
+diff --git a/input/desktop_play.cpp b/input/desktop_play.cpp
+--- /dev/null
++++ b/input/desktop_play.cpp
+@@ -0,0 +1,426 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++#include <SDL3/SDL_events.h>
++
++#include "common/logging/log.h"
++#include "common/singleton.h"
++#include "common/thread.h"
++#include "core/libraries/move/move.h"
++#include "core/libraries/pad/pad.h"
++#include "core/vr/vr_runtime.h"
++#include "input/controller.h"
++#include "input/desktop_play.h"
++
++namespace Input::DesktopPlay {
++
++namespace {
++
++using namespace Core::Vr;
++using namespace Libraries::Move;
++
++constexpr float Degrees = 3.14159265f / 180.0f;
++
++// Which of the player's keys and buttons are down, one bit each.
++enum Key : u32 {
++    LeanLeft = 1 << 0,
++    LeanRight = 1 << 1,
++    Crouch = 1 << 2,
++    Fire = 1 << 3,
++    Reload = 1 << 4,
++    Flick = 1 << 5,
++    Cross = 1 << 6,
++    Circle = 1 << 7,
++    Triangle = 1 << 8,
++    Square = 1 << 9,
++    Start = 1 << 10,
++    Recenter = 1 << 11,
++    PadCross = 1 << 12,
++    TiltUp = 1 << 13,
++    TiltDown = 1 << 14,
++    TiltReset = 1 << 15,
++    TurnLeft = 1 << 16,
++    TurnRight = 1 << 17,
++    Tilting = TiltUp | TiltDown | TurnLeft | TurnRight,
++};
++
++std::atomic<u32> keys{0};
++std::atomic<float> mouse_x{0.0f};
++std::atomic<float> mouse_y{0.0f};
++// Degrees the Move guns are turned up and to the right on their own, for a title whose own
++// calibration leaves them pointing off: SHADPS4_DESKTOP_GUN_PITCH / _GUN_YAW, then W/S and A/D
++// held (Home: none).
++float EnvDegrees(const char* name) {
++    const char* value = std::getenv(name);
++    return value != nullptr ? static_cast<float>(std::atof(value)) : 0.0f;
++}
++float gun_pitch = EnvDegrees("SHADPS4_DESKTOP_GUN_PITCH");
++float gun_yaw = EnvDegrees("SHADPS4_DESKTOP_GUN_YAW");
++
++u32 KeyFor(SDL_Scancode code) {
++    switch (code) {
++    case SDL_SCANCODE_Q:
++        return LeanLeft;
++    case SDL_SCANCODE_E:
++        return LeanRight;
++    case SDL_SCANCODE_C:
++    case SDL_SCANCODE_LCTRL:
++        return Crouch;
++    case SDL_SCANCODE_SPACE:
++        return Cross;
++    case SDL_SCANCODE_BACKSPACE:
++        return Circle;
++    case SDL_SCANCODE_T:
++        return Triangle;
++    case SDL_SCANCODE_X:
++        return Square;
++    case SDL_SCANCODE_RETURN:
++    case SDL_SCANCODE_ESCAPE:
++        return Start;
++    case SDL_SCANCODE_R:
++        return Recenter;
++    case SDL_SCANCODE_W:
++        return TiltUp;
++    case SDL_SCANCODE_S:
++        return TiltDown;
++    case SDL_SCANCODE_A:
++        return TurnLeft;
++    case SDL_SCANCODE_D:
++        return TurnRight;
++    case SDL_SCANCODE_HOME:
++        return TiltReset;
++    case SDL_SCANCODE_Z:
++        return PadCross;
++    default:
++        return 0;
++    }
++}
++
++u32 ButtonFor(u8 button) {
++    switch (button) {
++    case SDL_BUTTON_LEFT:
++        return Fire;
++    case SDL_BUTTON_RIGHT:
++        // A gamepad reloads with a flick; Move controllers with their Move button.
++        return std::getenv("SHADPS4_DESKTOP_DEVICE") != nullptr &&
++                       std::string_view{std::getenv("SHADPS4_DESKTOP_DEVICE")} == "pad"
++                   ? Flick
++                   : Reload;
++    case SDL_BUTTON_MIDDLE:
++        return Flick;
++    default:
++        return 0;
++    }
++}
++
++void Set(u32 key, bool down) {
++    if (down) {
++        keys.fetch_or(key, std::memory_order_relaxed);
++    } else {
++        keys.fetch_and(~key, std::memory_order_relaxed);
++    }
++}
++
++void Add(std::atomic<float>& value, float by) {
++    float old = value.load(std::memory_order_relaxed);
++    while (!value.compare_exchange_weak(old, old + by, std::memory_order_relaxed)) {
++    }
++}
++
++Vec3 Plus(const Vec3& a, const Vec3& b) {
++    return {a.x + b.x, a.y + b.y, a.z + b.z};
++}
++
++// Points the controller's -Z (where a Move points) from `from` at `at`.
++Quat Aim(const Vec3& from, const Vec3& at) {
++    Vec3 d{at.x - from.x, at.y - from.y, at.z - from.z};
++    const float length = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
++    if (length < 1e-4f) {
++        return {};
++    }
++    d = {d.x / length, d.y / length, d.z / length};
++    return FromYawPitch(std::atan2(-d.x, -d.z), std::asin(std::clamp(d.y, -1.0f, 1.0f)));
++}
++
++// SHADPS4_DESKTOP_TEST=<seconds>:<what>[,...], for unattended runs: at so many seconds after
++// start, "fire" or "reload" is clicked for 0.2 s, or "x<counts>" / "y<counts>" moves the mouse.
++void Test() {
++    const char* at = std::getenv("SHADPS4_DESKTOP_TEST");
++    if (at == nullptr) {
++        return;
++    }
++    struct Step {
++        float time;
++        std::string what;
++    };
++    std::vector<Step> steps;
++    while (*at != '\0') {
++        const char* end = std::strchr(at, ',');
++        const std::string item = end ? std::string(at, end) : std::string(at);
++        if (const auto colon = item.find(':'); colon != std::string::npos) {
++            steps.push_back({static_cast<float>(std::atof(item.c_str())), item.substr(colon + 1)});
++        }
++        at = end ? end + 1 : at + std::strlen(at);
++    }
++    std::thread{[steps] {
++        const auto start = std::chrono::steady_clock::now();
++        for (const Step& step : steps) {
++            std::this_thread::sleep_until(start + std::chrono::duration<float>(step.time));
++            LOG_INFO(Input, "Desktop play test at {:.1f} s: {}", step.time, step.what);
++            if (step.what == "fire" || step.what == "reload") {
++                const u32 key = step.what == "fire" ? Fire : Reload;
++                Set(key, true);
++                std::this_thread::sleep_for(std::chrono::milliseconds(200));
++                Set(key, false);
++            } else if (step.what[0] == 'x') {
++                Add(mouse_x, static_cast<float>(std::atof(step.what.c_str() + 1)));
++            } else if (step.what[0] == 'y') {
++                Add(mouse_y, static_cast<float>(std::atof(step.what.c_str() + 1)));
++            }
++        }
++    }}.detach();
++}
++
++void Feed() {
++    Common::SetCurrentThreadName("shadPS4:DesktopPlay");
++    Test();
++    static const float sensitivity = [] {
++        const char* value = std::getenv("SHADPS4_DESKTOP_SENS");
++        const float degrees = value != nullptr ? static_cast<float>(std::atof(value)) : 0.08f;
++        return std::clamp(degrees, 0.005f, 2.0f) * Degrees;
++    }();
++    // SHADPS4_DESKTOP_DEVICE=pad: the player holds the gamepad (Rush of Blood's "Wireless
++    // Controller") instead of a pair of Move controllers.
++    static const bool use_pad = [] {
++        const char* value = std::getenv("SHADPS4_DESKTOP_DEVICE");
++        return value != nullptr && std::string_view{value} == "pad";
++    }();
++    auto* const controller = (*Common::Singleton<GameControllers>::Instance())[0];
++    Libraries::Pad::OrbisPadButtonDataOffset previous_pad{};
++    auto& vr = Runtime::Instance();
++    // Poses are counted from where the player sits, as for scripted input.
++    vr.FixSeat();
++
++    float yaw = 0.0f;
++    float pitch = 0.0f;
++    Vec3 lean{};
++    float roll = 0.0f;
++    u32 previous{};
++    auto last = std::chrono::steady_clock::now();
++    auto flick_until = last;
++    while (true) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(4));
++        const auto now = std::chrono::steady_clock::now();
++        const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.05f);
++        last = now;
++        const u32 down = keys.load(std::memory_order_relaxed);
++        const u32 pressed = down & ~previous;
++        previous = down;
++
++        // (Turning right and looking down are negative angles.)
++        yaw = std::clamp(yaw - mouse_x.exchange(0.0f, std::memory_order_relaxed) * sensitivity,
++                         -150.0f * Degrees, 150.0f * Degrees);
++        pitch = std::clamp(pitch - mouse_y.exchange(0.0f, std::memory_order_relaxed) * sensitivity,
++                           -80.0f * Degrees, 80.0f * Degrees);
++        if (pressed & Recenter) {
++            yaw = pitch = 0.0f;
++        }
++
++        // Leaning and crouching ease in and out, as a body does.
++        const bool both = (down & LeanLeft) && (down & LeanRight);
++        const float side = both ? 0.0f
++                                : (down & LeanLeft) ? -1.0f
++                                : (down & LeanRight) ? 1.0f
++                                                     : 0.0f;
++        const bool crouch = both || (down & Crouch);
++        const Quat body = FromYawPitch(yaw, 0.0f);
++        const Vec3 lean_target = Rotate(body, {side * 0.32f, crouch ? -0.4f : 0.0f, 0.0f});
++        const float ease = 1.0f - std::exp(-dt / 0.08f);
++        lean.x += (lean_target.x - lean.x) * ease;
++        lean.y += (lean_target.y - lean.y) * ease;
++        lean.z += (lean_target.z - lean.z) * ease;
++        roll += (-side * 12.0f * Degrees - roll) * ease;
++
++        const Quat head_turn = FromYawPitchRoll(yaw, pitch, roll);
++        vr.UpdateHead({.pose = {.position = lean, .orientation = head_turn}, .tracked = true});
++        if (pressed & Recenter) {
++            vr.RequestRecenter();
++        }
++
++        // Both guns point at what is in the middle of the view, some way off.
++        const Vec3 gaze = Rotate(FromYawPitch(yaw, pitch), {0.0f, 0.0f, -1.0f});
++        const Vec3 target = Plus(lean, {gaze.x * 8.0f, gaze.y * 8.0f, gaze.z * 8.0f});
++        if (pressed & Flick) {
++            flick_until = now + std::chrono::milliseconds(use_pad ? 200 : 150);
++        }
++        const bool flicking = now < flick_until;
++        u16 buttons = 0;
++        buttons |= (down & Fire) ? ORBIS_MOVE_BUTTON_T : 0;
++        buttons |= (down & Reload) ? ORBIS_MOVE_BUTTON_MOVE : 0;
++        buttons |= (down & Cross) ? ORBIS_MOVE_BUTTON_CROSS : 0;
++        buttons |= (down & Circle) ? ORBIS_MOVE_BUTTON_CIRCLE : 0;
++        buttons |= (down & Triangle) ? ORBIS_MOVE_BUTTON_TRIANGLE : 0;
++        buttons |= (down & Square) ? ORBIS_MOVE_BUTTON_SQUARE : 0;
++        if (use_pad) {
++            // Held before the chest, pointing at what is in the middle of the view. Its flick
++            // (how a gamepad reloads in Rush of Blood) is a real one, 0.2 s long: the front
++            // tips up 40 degrees and the controller rises 12 cm, and both come back. Its
++            // sensors and the camera see that as it happens. (SHADPS4_DESKTOP_FLICK=down for
++            // the other way.)
++            using Libraries::Pad::OrbisPadButtonDataOffset;
++            static const float way = [] {
++                const char* value = std::getenv("SHADPS4_DESKTOP_FLICK");
++                return value != nullptr && std::string_view{value} == "down" ? -1.0f : 1.0f;
++            }();
++            Vec3 at = Plus(lean, Rotate(body, {0.0f, -0.3f, -0.35f}));
++            Quat aim = Aim(at, target);
++            float tilt_rate = 0.0f;
++            Vec3 velocity{};
++            float lift_acceleration = 0.0f;
++            if (flicking) {
++                constexpr float Length = 0.2f;
++                constexpr float W = 2.0f * 3.14159265f / Length;
++                const float t =
++                    Length - std::chrono::duration<float>(flick_until - now).count();
++                const float tilt = way * 20.0f * Degrees * (1.0f - std::cos(W * t));
++                tilt_rate = way * 20.0f * Degrees * W * std::sin(W * t);
++                const float lift = way * 0.06f * (1.0f - std::cos(W * t));
++                velocity = {0.0f, way * 0.06f * W * std::sin(W * t), 0.0f};
++                lift_acceleration = way * 0.06f * W * W * std::cos(W * t);
++                aim = Normalize(Multiply(aim, FromYawPitch(0.0f, tilt)));
++                at.y += lift;
++            }
++            vr.UpdatePad({.pose = {.position = at, .orientation = aim},
++                          .linear_velocity = velocity,
++                          .angular_velocity = Rotate(aim, {tilt_rate, 0.0f, 0.0f}),
++                          .tracked = true});
++            // The motion sensors, in the controller's frame (+Y out of its face): turning about
++            // its own X, and gravity plus the lift.
++            const float gyro[3]{tilt_rate, 0.0f, 0.0f};
++            const Vec3 felt = Rotate(Conjugate(aim), {0.0f, 9.80665f + lift_acceleration, 0.0f});
++            const float acceleration[3]{felt.x, felt.y, felt.z};
++            controller->UpdateGyro(gyro);
++            controller->UpdateAcceleration(acceleration);
++            OrbisPadButtonDataOffset pad{};
++            if (down & Fire) {
++                // Both guns, and Cross for the menus.
++                pad |= OrbisPadButtonDataOffset::R2 | OrbisPadButtonDataOffset::L2 |
++                       OrbisPadButtonDataOffset::Cross;
++            }
++            if (down & (Cross | PadCross)) {
++                pad |= OrbisPadButtonDataOffset::Cross;
++            }
++            if (down & Circle) {
++                pad |= OrbisPadButtonDataOffset::Circle;
++            }
++            if (down & Triangle) {
++                pad |= OrbisPadButtonDataOffset::Triangle;
++            }
++            if (down & Square) {
++                pad |= OrbisPadButtonDataOffset::Square;
++            }
++            if (down & Start) {
++                pad |= OrbisPadButtonDataOffset::Options;
++            }
++            if (pad != previous_pad) {
++                const int trigger = (down & Fire) ? 255 : 0;
++                controller->ApplyRemoteState(pad, {128, 128, 128, 128, trigger, trigger}, false,
++                                             0.0f, 0.0f);
++                previous_pad = pad;
++            }
++            continue;
++        }
++        // 30 degrees a second while held; where they ended up is logged when let go.
++        const float step = 30.0f * dt;
++        gun_pitch += (down & TiltUp) ? step : (down & TiltDown) ? -step : 0.0f;
++        gun_yaw += (down & TurnRight) ? step : (down & TurnLeft) ? -step : 0.0f;
++        if (pressed & TiltReset) {
++            gun_pitch = gun_yaw = 0.0f;
++        }
++        static u32 was_tilting = 0;
++        if ((was_tilting & ~down & Tilting) || (pressed & TiltReset)) {
++            LOG_INFO(Input, "Desktop play: guns turned {:.0f} degrees up, {:.0f} right",
++                     gun_pitch, gun_yaw);
++        }
++        was_tilting = down & Tilting;
++        for (int index = 0; index < MaxMoves; ++index) {
++            // 0 is the right hand. The arms are held out as the game's calibration board shows
++            // (straight ahead at shoulder height), so pressing Move there calibrates them right.
++            const float hand = index == 0 ? 0.18f : -0.18f;
++            const Vec3 at = Plus(lean, Rotate(body, {hand, -0.2f, -0.55f}));
++            Quat aim = Normalize(
++                Multiply(Aim(at, target), FromYawPitch(-gun_yaw * Degrees, gun_pitch * Degrees)));
++            DeviceState state{.pose = {.position = at, .orientation = aim}, .tracked = true};
++            if (flicking) {
++                // A sharp turn downwards and back, the way a gun is shaken.
++                state.pose.orientation = Normalize(
++                    Multiply(aim, FromYawPitch(0.0f, -35.0f * Degrees)));
++                state.angular_velocity = Rotate(body, {-8.0f, 0.0f, 0.0f});
++            }
++            const u16 own = index == 0 && (down & Start) ? ORBIS_MOVE_BUTTON_START : 0;
++            vr.UpdateMove(index, state, buttons | own, (down & Fire) ? 255 : 0);
++        }
++
++        static bool pad_cross = false;
++        if (const bool want = (down & PadCross) != 0; want != pad_cross) {
++            pad_cross = want;
++            controller->Button(Libraries::Pad::OrbisPadButtonDataOffset::Cross, want);
++        }
++    }
++}
++
++} // namespace
++
++bool Enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHADPS4_DESKTOP_PLAY");
++        return value != nullptr && std::string_view{value} == "1";
++    }();
++    return enabled;
++}
++
++void Start() {
++    LOG_INFO(Input, "Desktop play: mouse looks and aims, Q/E lean, Q+E or C crouch, left click "
++                    "fires, right click is the Move button, Space Cross, Enter/Esc START, R recenters");
++    std::thread{Feed}.detach();
++}
++
++bool OnEvent(const SDL_Event& event) {
++    switch (event.type) {
++    case SDL_EVENT_MOUSE_MOTION:
++        Add(mouse_x, event.motion.xrel);
++        Add(mouse_y, event.motion.yrel);
++        return true;
++    case SDL_EVENT_MOUSE_BUTTON_DOWN:
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++        Set(ButtonFor(event.button.button), event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
++        return true;
++    case SDL_EVENT_MOUSE_WHEEL:
++        return true;
++    case SDL_EVENT_KEY_DOWN:
++    case SDL_EVENT_KEY_UP:
++        if (event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12) {
++            return false;
++        }
++        Set(KeyFor(event.key.scancode), event.type == SDL_EVENT_KEY_DOWN);
++        return true;
++    case SDL_EVENT_WINDOW_FOCUS_LOST:
++        keys.store(0, std::memory_order_relaxed);
++        return false;
++    default:
++        return false;
++    }
++}
++
++} // namespace Input::DesktopPlay
+diff --git a/input/desktop_play.h b/input/desktop_play.h
+--- /dev/null
++++ b/input/desktop_play.h
+@@ -0,0 +1,26 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++union SDL_Event;
++
++namespace Input::DesktopPlay {
++
++/// A PlayStation VR title played on a monitor with keyboard and mouse (SHADPS4_DESKTOP_PLAY=1):
++/// the mouse turns the head and both Move controllers point where the head looks, at the middle
++/// of the screen. Q / E lean left / right, both (or C) crouch. Left click pulls both triggers,
++/// right click presses both Move buttons, middle click flicks both guns. Space is Cross,
++/// Backspace Circle, T Triangle, X Square, Enter START, R resets the view, Z the gamepad's Cross.
++/// SHADPS4_DESKTOP_SENS=<degrees per mouse count> (0.08).
++bool Enabled();
++
++/// Starts the thread that feeds the headset and controllers.
++void Start();
++
++/// Takes the window's keyboard and mouse events while enabled: none of them reaches the
++/// emulator's own keyboard bindings, which would act as the gamepad (and a title playing with
++/// Move controllers pauses for a gamepad picked up). Function keys go on. True if consumed.
++bool OnEvent(const SDL_Event& event);
++
++} // namespace Input::DesktopPlay
