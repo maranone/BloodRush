@@ -28,6 +28,7 @@ Huge shout-out to **detective_yoshi**
 | `rob-2d.patch` | The same delta as a unified diff against `src/` |
 | `BASE_COMMIT.txt` | Upstream commit this patch was based on |
 | `rob2d-src/` | Complete snapshot of the 2D emulator source tree (shadPS4 plus our changes), as built by `rob2d/build2d.py`; no game files, binaries or build output |
+| `rushquest-src/` | Complete snapshot of the PC VR / Quest emulator source tree (`RushQuest/shadps4-arm64-main/src`); no game files, binaries or build output |
 | `LICENSE.md` | GPL-2.0-or-later (same as shadPS4) |
 
 
