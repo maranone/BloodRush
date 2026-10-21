@@ -16,7 +16,7 @@ If you enjoy this work, you can buy me a coffee: **https://ko-fi.com/retrodepth*
 
 ## Thanks
 
-Huge shout-out to **Rodrigo Marcos - LAB VR** the crash fixer and motion sim god https://www.youtube.com/watch?v=MtbgST3LOeU
+Huge shout-out to **Rodrigo Marcos - LAB VR** the crash fixer and motion sim god **https://www.youtube.com/watch?v=MtbgST3LOeU**
 
 Huge shout-out to **detective_yoshi**
 
