@@ -4,7 +4,7 @@ Features: 4K/PCVR(200%)/Quest(Not yet, native working but not optimized)
 
 Watch on Youtube:
 
-[![Watch on YouTube](https://img.youtube.com/vi/rQAwTf139lM/maxresdefault.jpg)](https://youtu.be/rQAwTf139lM)
+[![Watch on YouTube](https://img.youtube.com/vi/rQAwTf139lM/maxresdefault.jpg)](https://www.youtube.com/watch?v=MtbgST3LOeU)
 
 # Rush of Blood — shadPS4 2D desktop changes
 
@@ -15,6 +15,8 @@ Changed sources from shadPS4(https://github.com/shadps4-emu/shadPS4). Use these 
 If you enjoy this work, you can buy me a coffee: **https://ko-fi.com/retrodepth**
 
 ## Thanks
+
+Huge shout-out to **Rodrigo Marcos - LAB VR** the crash fixer and motion sim god
 
 Huge shout-out to **detective_yoshi**
 
